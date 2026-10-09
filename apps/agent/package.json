@@ -1,0 +1,16 @@
+{
+	"name": "@siftory/agent",
+	"private": true,
+	"version": "0.1.0",
+	"scripts": {
+		"dev": "bun run --watch src/main.ts --dev",
+		"start": "bun run src/main.ts",
+		"test": "bun test"
+	},
+	"dependencies": {
+		"@earendil-works/chord": "1.1.0",
+		"@earendil-works/pi-ai": "1.1.0",
+		"@earendil-works/pi-durable": "1.1.0",
+		"@siftory/protocol": "*"
+	}
+}
