@@ -119,7 +119,12 @@ main {
 	background: #8b2b3a;
 }
 
+.hint { color: #8a8f98; font-size: 13px; }
+
 .settings {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
 	padding: 20px 0;
 	display: flex;
 	flex-direction: column;

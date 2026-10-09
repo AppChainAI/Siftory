@@ -1,165 +1,96 @@
-# Siftory 桌面应用架构（开发文档）
+# Siftory 桌面应用架构
 
-> 状态：已确认的基线架构。本文档是开发的依据，改动架构先改本文档。
+> 当前实现基线。修改架构时同步更新本文档。业务管线规划与已实现能力分别说明。
 
-## 1. 技术选型
+## 1. 技术与进程边界
 
-```
-┌─ Tauri App ─────────────────────────────────┐
-│  Webview UI (React + Vite)                   │
-│    │ fetch + WebSocket → 127.0.0.1:随机端口   │
-│  Rust（薄）：                                  │
-│    ·  spawn/守护 sidecar（崩溃重启、退出杀死）  │
-│    ·  分配随机端口 + 生成一次性 token          │
-│    ·  窗口/托盘/自动更新/原生通知              │
-└──────────────│───────────────────────────────┘
-               │ spawn (Tauri externalBin)
-┌─ Sidecar: siftory-agent（Bun 单文件二进制）───┐
-│  pi-durable Harness                          │
-│    ├─ Storage: SQLite（adapter 包 bun:sqlite）│
-│    ├─ HTTP 端点: submit / configure / config  │
-│    └─ WS 推送: conversation.viewState()       │
-└──────────────────────────────────────────────┘
+```text
+Tauri 壳 ──管理── Bun sidecar
+    │                ├─ pi-durable Harness
+    │                ├─ SQLite session + 独占所有权锁
+    │                ├─ HTTP 命令接口
+    │                └─ WebSocket committed snapshots
+    └─ React WebView ──HTTP / WS──┘
 ```
 
-| 决策 | 选择 | 理由 |
-|---|---|---|
-| 桌面壳 | Tauri | 包体小（~15MB）、原生体验；不为 Electron 的 Chromium 付 150MB |
-| Agent 运行时 | pi-durable（Bun sidecar） | 持久化内核：会话/工具调用先落存储再展示，崩溃续跑——视频渲染这类长任务的刚需 |
-| sidecar 通信 | localhost HTTP + WebSocket | webview 直连，Rust 不中转消息，只管进程生命周期 |
-| sidecar 安全 | 绑定 127.0.0.1 + 随机端口 + Bearer token | 不加 token 则同机任意进程可驱动 Agent |
-| 存储 | SQLite（WAL） | pi-durable 官方后端；adapter 用官方 conformance 套件验收 |
-| UI 框架 | React + Vite + TypeScript | 主流默认，无特殊需求不折腾 |
+- React 负责界面、输入草稿、连接和展示状态，不读写数据库。
+- Rust 负责定位安装包里的 sidecar、启动握手、崩溃重启和退出清理。Agent 业务逻辑仍在 Bun 中。
+- sidecar 绑定 `127.0.0.1`，端口由 sidecar 用端口 `0` 自行分配；通过 stdout 的 JSON `ready` 帧通知 Rust。
+- React 每次请求、重连通过 `agent_connection` 获取当前端口与 token，刷新不依赖 `window.eval()` 注入。
+- 正式版校验 Bearer token 与显式 Origin 白名单；只有 WebSocket upgrade 可用查询参数 token。HTTP 预检不要求 token，实际请求仍要求认证。
+- Rust 使用 `desktop.lock` 阻止同一数据目录的桌面实例重复运行；Agent 使用独立的 `agent.lock.sqlite` 排他事务防止任何两个 Agent 打开同一 session。
+- sidecar 持续失败最多尝试三次；稳定运行一分钟后重置失败计数。应用退出先请求关闭 Harness，三秒后仍未退出才强制终止。
+- Rust 持有 sidecar 的 stdin 管道，壳崩溃后 EOF 会触发 Agent 关闭，避免孤儿进程长期占用存储。
 
-## 2. pi-durable 关键事实（开发前必读）
+## 2. 目录
 
-- **Experimental**：API 随版本变动，锁死版本号，升级前读 CHANGELOG。
-- **单进程持有存储**：同一时刻只有一个进程能打开存储，无跨进程锁。Harness 必须住在 sidecar 里，UI 永不直连存储。
-- **一切状态可订阅**：`conversation.viewState()` 返回只读 Chord 状态，每次 commit 后更新——UI 的全部数据来自它（entries、pi.live 流式输出、pi.inbox、pi.usage、pi.agent）。
-- **与 pi Agent 的关系**：pi-durable 是 pi 的下一代内核（Pico5），pi-coding-agent 1.x 仍跑在旧内核 pi-agent-core 上。**pi 扩展插件不能在 pi-durable 里直接用**（两套扩展 API），可复用的只有纯工具逻辑（TypeBox schema + execute 函数体）和 provider 配置。
-- **共享底层**：`@earendil-works/pi-ai`（模型访问）、`@earendil-works/chord`（文档状态）、TypeBox。
-
-## 3. 目录结构
-
-```
-Siftory/
-├── package.json                    # Bun workspace 根
-│
-├── apps/
-│   ├── desktop/                    # Tauri 壳
-│   │   ├── src-tauri/
-│   │   │   ├── src/main.rs         # sidecar 生命周期、端口/token、窗口
-│   │   │   ├── tauri.conf.json     # bundle.externalBin → sidecar 产物
-│   │   │   └── Cargo.toml
-│   │   └── ui/                     # Webview 前端（React + Vite）
-│   │       └── src/
-│   │           ├── api/client.ts   # 只依赖 packages/protocol 的类型
-│   │           └── components/     # Composer 等
-│   │
-│   └── agent/                      # ★ sidecar：pi-durable 宿主（Bun）
-│       ├── src/
-│       │   ├── main.ts             # 入口：HTTP/WS 服务、token 校验、--data-dir
-│       │   ├── config.ts           # LLM 提供商配置（config.json + env）
-│       │   ├── harness.ts          # Harness.open() 装配
-│       │   ├── storage/sqlite.ts   # bun:sqlite → SqliteDatabase facade
-│       │   ├── server/             # http.ts / ws.ts
-│       │   └── extensions/         # ★ pi-durable 扩展，一文件夹一个
-│       │       ├── index.ts        # installAll(registry)：显式装配清单
-│       │       ├── research/       # Discover 阶段
-│       │       ├── synthesize/     # Synthesize 阶段
-│       │       ├── narrate/        # Narrate 阶段
-│       │       └── render/         # Visualize 阶段
-│       └── test/                   # storage conformance + 崩溃续跑
-│
-├── packages/
-│   └── protocol/                   # sidecar ↔ UI 共享类型（纯 TS 类型）
-│
-└── scripts/
-    ├── dev.ts                      # 并行拉起 sidecar + vite + tauri dev
-    └── build-sidecar.ts            # bun build --compile × 4 平台
+```text
+apps/agent/src/
+  harness.ts                  内核与供应商装配
+  config.ts                   CredentialStore
+  custom-providers.ts         供应商定义持久化与注册
+  storage/{sqlite,ownership,files}.ts
+  server/{http,ws,projection,access}.ts
+  extensions/{research,synthesize,narrate,render}/
+apps/agent/test/               存储契约、接口、进程恢复回归测试
+apps/desktop/src-tauri/        原生壳
+apps/desktop/ui/               React 客户端
+packages/protocol/src/         协议类型和运行时请求 schema
+scripts/                      开发、编译与二进制验证
 ```
 
-## 4. 扩展管理约定
+当前规模不需要把业务拆成更多公共包。随着供应商和工作流增长，再拆分 `harness.ts` 的装配与应用服务。
 
-pi-durable 扩展是**进程内代码**：必须与 Harness 同进程、编译进 sidecar；没有自动发现机制，装配清单显式维护。
+## 3. pi-durable 约束
 
-每个扩展文件夹的固定形状：
+依赖固定为 `pi-durable / pi-ai / chord 1.1.0`。升级须同时检查包内文档、类型和测试；GitHub `main` 不等同于锁定版本。
 
-```
-research/
-├── index.ts        # export default defineExtension({...})，只装配不写逻辑
-├── tools/          # 一个 defineTool 一个文件
-├── sections.ts     # 系统提示词节
-├── hooks.ts        # 钩子（beforeTool 等）
-└── docs.ts         # defineDoc：该扩展的自定义状态
-```
+- 对话通过 `submit()` 接收输入；会话模型、思考级别和指令通过 `configure()` 持久化到 `pi.agent`。
+- UI 展示来自 committed state；视图用 `watch()` 串行订阅，终态失败从持久化 submission receipt 获取。
+- 不在数据库之外重复维护任务完成状态。重启调用 `resume()`；关闭调用 `harness.close()` 保留未完成工作。
+- SQLite adapter 串行化无关操作，事务只能使用其句柄；回调结束后句柄失效。存储一致性套件及句柄回归测试纳入仓库。
+- WAL + `synchronous=NORMAL` 保证普通进程崩溃恢复；不承诺最近写入一定抵抗断电。
+- 内核不会自动保证外部付费请求或文件生成恰好执行一次。未来工具必须明确 replay 策略、幂等键、检查点与任务 ownership。
 
-装配清单 `extensions/index.ts`：
+## 4. 扩展与业务管线
 
-```typescript
-export const builtins = [research, synthesize, narrate, render]; // 顺序有意义
-export function installAll(registry: Registry) {
-	for (const ext of builtins) registry.install(ext);
-}
-```
+四个扩展显式安装；提示词使用不同 section key，避免后装扩展覆盖前面的角色。当前 root 选择所有内置扩展，扩展只有提示词，没有研究或视频工具。
 
-规则：
+业务管线仍待实现：Discover → Synthesize → Narrate → Generate → Produce。
 
-1. **顺序有意义**：同名工具后者覆盖前者；`wraps` 依赖安装顺序。
-2. **`docs.ts` 跟扩展走**：自定义状态（研究笔记、分镜稿、渲染进度）的定义属于产生它的扩展。
-3. **按会话选择**：扩展装在全局 registry，会话用 `configure({ extensions: [...] })` 选子集。管线各阶段的会话只暴露该阶段工具。
-4. **热重载**：`registry.install()` 同名原地替换；在跑的调用用旧代码完成，下一阶段用新代码。
-5. **用户扩展（预留不做）**：约定 `appDataDir/extensions/*.ts`，Bun 可直接 import TS。涉及信任/隔离，是产品决策，待内置扩展跑通后再议。
+后续设计原则：
 
-## 5. 数据存储位置
+1. 用 durable task 表达阶段转换、等待、重试和取消，不依靠提示词文字判断完成。
+2. 用 typed documents 保存项目、研究来源、报告、脚本、分镜、审核决定和产物元数据。
+3. 阶段可用独立 conversation 并显式选择扩展；不强制每阶段都使用 Agent。
+4. 图片、音频和视频存文件系统；数据库记录路径、版本和生成任务 ID。
+5. 外部生成任务提交前记录意图和幂等键，恢复时查询已有任务，避免重复扣费。
+6. 审核步骤与修改版本持久化；发布、取消与退出具有不同语义。
 
-| 场景 | 位置 |
-|---|---|
-| dev（`bun run dev`） | `<仓库>/apps/agent/.data/`（main.ts 默认值） |
-| release 桌面版 | macOS `~/Library/Application Support/ai.appchain.siftory/`；Windows `%APPDATA%\ai.appchain.siftory\`；Linux `~/.local/share/ai.appchain.siftory/`（main.rs 传入 `--data-dir`） |
+## 5. 配置与协议
 
-内容：`siftory.sqlite`（会话、pi.agent 配置、未完成任务；WAL 伴生文件要一起备份）、`auth.json`（API key，0600）、`providers.json`（自定义供应商）。
+- `auth.json` 保存密钥（Unix `0600`）；`providers.json` 保存非密钥定义。
+- 文件不存在使用默认值；损坏、权限或格式问题报错，不静默覆盖。
+- 文件通过独立临时文件、flush、rename 替换；单宿主内配置变更串行处理。
+- 两个配置文件和 session 数据库不是一个原子事务。捕获到的供应商更新失败尝试回滚定义，但进程崩溃仍可能发生在跨文件写入之间。
+- 自定义供应商 ID 必须符合 `custom-` slug，禁止覆盖内置提供商；当前模型使用的供应商不能直接删除。
+- 协议 ID 统一编码为字符串；请求采用 TypeBox runtime schema 验证，限制字段、长度和 URL 形状。
+- HTTP `/api/chat` 返回 admission receipt；终态失败通过 WS 显示。客户端失败保留草稿，同一内容重试沿用 requestId。
+- WS 快照最多包含最近 200 条文本消息；更早历史经 `/api/history?before=...` 分页读取。慢连接保留最新快照，重连重新获取当前状态。
 
-## 6. LLM 提供商与会话配置
+## 6. 启动、构建与验证
 
-三层配置面（pi-durable 原生）：
+根工作区包含 agent、desktop、ui 和 protocol。常用命令见根 README。
 
-| 层级 | 配置项 | 存储 |
-|---|---|---|
-| 会话级（`pi.agent` 文档） | `model`、`thinkingLevel`（off~max）、`instructions`（追加系统提示词）、`tools`/`extensions`、`cwd` | `siftory.sqlite`（持久、崩溃不丢、fork 继承） |
-| 提供商级 | `apiKey`（env 变量自动兜底合并）；内置 provider 的 baseUrl 出厂写死 | `<data-dir>/auth.json`（0600，pi 同款形状），`FileCredentialStore` 实现 pi-ai 的 `CredentialStore` |
-| 自定义供应商 | OpenAI 兼容端点：`name`、`baseUrl`、模型列表；key 仍走 auth.json | `<data-dir>/providers.json`（非密钥）；`createProvider + openAICompletionsApi()` 注册，`setProvider` live 生效 |
+- `bun run dev`：假模型 sidecar + 固定 5173 的 Vite，数据目录 `apps/agent/.data`。
+- `bun run dev:desktop`：先编当前平台 sidecar，再启动开发服务和 Tauri debug 壳。
+- `bun run build:desktop`：构建钩子生成前端和 Tauri 目标 sidecar，再打包。
+- `managed-sidecar` feature 可在 debug 检查正式版 supervisor 分支。
+- 测试覆盖官方存储契约、配置损坏、重复提交、Origin/token、WebSocket 终态错误、强杀进程后续跑和父进程管道关闭。
+- CI 运行三平台检查；本地验证不代替三平台安装包验证、签名和 macOS 公证。
 
-- 自定义供应商与内置 deepseek 同款构造；OpenAI 兼容差异（参数支持等）由 pi-ai 从 baseUrl 自动探测。
-| 运行策略级（`HarnessSettings`） | `stream.timeoutMs`、`retry`、`compaction` 阈值 | 不存储，宿主代码给 |
+## 7. 数据与备份
 
-- sidecar 暴露 `GET/PUT /api/config`；会话级配置走 `root.configure()`（单 commit），改完即生效，无需重启。
-- API key 只存 auth.json，不进 UI 的 localStorage，不进协议消息（UI 只能看到"已配置/未配置"）。
-- 没有独立的应用 config.json：模型选择的持久化由 `pi.agent` 承担，不重复造。
+release 数据目录由 Tauri `app_data_dir()` 解析，标识符为 `ai.appchain.siftory`。锁文件可以在退出后保留，OS 锁会自动释放，运行时不可删锁文件。
 
-## 7. 桌面端启动
-
-| 场景 | 命令 | 说明 |
-|---|---|---|
-| 浏览器开发（最轻） | `bun run dev` | sidecar(47911, faux) + Vite(5173) |
-| 桌面窗口开发 | `bun run dev:desktop` | 上面两个 + `tauri dev`；debug 构建不 spawn sidecar，UI 直连 47911 |
-| sidecar 二进制 | `bun run build:sidecar [bun-target]` | 产物到 `apps/desktop/bin/siftory-agent-<triple>`；**tauri 编译期就校验 externalBin 存在，首次 tauri dev 前必须先编当前平台的** |
-| 打包分发 | `cd apps/desktop && bunx tauri build` | release：Rust spawn sidecar（随机端口 + token），eval 注入 webview |
-
-注意：`tauri.conf.json` 的 `externalBin` 路径相对 src-tauri 目录解析（`../bin/siftory-agent`）。
-
-## 8. 落地路线（按风险从高到低）
-
-| 步骤 | 内容 | 验证标准 |
-|---|---|---|
-| ① | Bun + pi-durable + bun:sqlite adapter | conformance 套件全绿 + 杀进程续跑 |
-| ② | sidecar HTTP/WS 协议 | curl/wscat 跑通一次问答 |
-| ③ | Tauri 壳 + 打包 matrix | 三端安装包跑起来 |
-| ④ | Siftory 业务工具（search/fetch/视频合成） | 管线各阶段会话可用 |
-
-## 9. 已知风险
-
-1. `bun:sqlite` adapter 行为需 conformance 套件验证（步骤①）。
-2. `bun build --compile` 对动态 import 的支持未验证（影响将来的用户扩展）。
-3. macOS 公证 Bun 二进制的流程待趟（步骤③）。
-4. pi-durable Experimental，版本升级可能 breaking。
+备份应先停止 Agent 再复制目录，或采用 SQLite 在线备份。不能仅复制正在写入的主数据库文件而忽略 WAL。

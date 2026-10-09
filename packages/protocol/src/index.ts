@@ -7,7 +7,7 @@
 export interface ProviderStatus {
 	id: string;
 	name: string;
-	/** 已配置密钥（来自 config 或环境变量） */
+	/** 已配置密钥（来自 auth.json 或环境变量） */
 	configured: boolean;
 }
 
@@ -19,7 +19,7 @@ export interface ModelRef {
 /** GET /api/config 的响应 */
 export interface ConfigView {
 	providers: ProviderStatus[];
-	/** 各提供商可用模型（仅已配置的提供商有值） */
+	/** 各提供商的已知模型目录；是否有密钥由 providers 表达 */
 	models: Record<string, string[]>;
 	/** 当前会话生效的 LLM 配置 */
 	agent: AgentConfigView;
@@ -43,7 +43,14 @@ export interface AgentConfigUpdate {
 }
 
 /** pi-ai 的 ModelThinkingLevel 镜像（协议独立，不依赖 pi 包） */
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ThinkingLevel =
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 
 /** 当前生效的会话级配置（GET /api/config 返回，resolved 值） */
 export interface AgentConfigView {
@@ -76,6 +83,9 @@ export interface ChatSnapshot {
 	messages: ChatMessage[];
 	/** 有 run 在进行中 */
 	busy: boolean;
+	queued: number;
+	/** Load older messages through HTTP instead of repeating them in every streaming frame. */
+	historyBefore?: string;
 	/** 正在流式生成的助手部分消息（可能不完整） */
 	streamingText?: string;
 	/** 最近一次失败原因（模型未配置、网络错误等） */
@@ -101,4 +111,9 @@ export interface CustomProvider {
 /** PUT /api/custom-providers 的请求体（upsert；apiKey 给了才更新） */
 export interface CustomProviderUpsert extends CustomProvider {
 	apiKey?: string;
+}
+
+export interface HistoryPage {
+	messages: ChatMessage[];
+	before?: string;
 }

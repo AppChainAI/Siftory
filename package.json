@@ -1,19 +1,25 @@
 {
-	"name": "siftory",
-	"private": true,
-	"workspaces": [
-		"apps/agent",
-		"apps/desktop/ui",
-		"packages/protocol"
-	],
-	"scripts": {
-		"dev": "bun scripts/dev.ts",
-		"dev:desktop": "bun scripts/dev-desktop.ts",
-		"dev:agent": "bun run --cwd apps/agent dev",
-		"dev:ui": "bun run --cwd apps/desktop/ui dev",
-		"build:sidecar": "bun scripts/build-sidecar.ts"
-	},
-	"devDependencies": {
-		"@tauri-apps/cli": "^2.12.1"
-	}
+  "name": "siftory",
+  "private": true,
+  "workspaces": [
+    "apps/agent",
+    "apps/desktop",
+    "apps/desktop/ui",
+    "packages/protocol"
+  ],
+  "scripts": {
+    "dev": "bun scripts/dev.ts",
+    "dev:desktop": "bun scripts/dev-desktop.ts",
+    "dev:agent": "bun run --cwd apps/agent dev",
+    "dev:ui": "bun run --cwd apps/desktop/ui dev",
+    "build:sidecar": "bun scripts/build-sidecar.ts",
+    "check": "bun run --cwd apps/agent check && bun run --cwd apps/desktop/ui build",
+    "test": "bun run --cwd apps/agent test",
+    "build:desktop": "bun run --cwd apps/desktop build",
+    "test:sidecar": "bun scripts/test-sidecar.ts",
+    "test:native": "bun scripts/test-sidecar.ts --native"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1"
+  }
 }

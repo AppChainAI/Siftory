@@ -21,6 +21,7 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 	const [modelId, setModelId] = useState("");
 	const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>("off");
 	const [instructions, setInstructions] = useState("");
+	const [error, setError] = useState<string>();
 	const [saving, setSaving] = useState(false);
 
 	const reload = async () => {
@@ -34,7 +35,7 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 		}
 	};
 	useEffect(() => {
-		reload();
+		void reload().catch((error) => setError(String(error)));
 	}, []);
 
 	const models = config?.models[provider] ?? [];
@@ -42,9 +43,10 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 
 	const save = async () => {
 		setSaving(true);
+		setError(undefined);
 		try {
-			if (apiKey) await putConfig({ provider: { id: provider, apiKey } });
 			await putConfig({
+				...(apiKey ? { provider: { id: provider, apiKey } } : {}),
 				agent: {
 					...(modelId ? { model: { provider, modelId } } : {}),
 					thinkingLevel,
@@ -54,19 +56,45 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 			setApiKey("");
 			await reload();
 			props.onSaved();
+		} catch (error) {
+			setError(error instanceof Error ? error.message : "保存失败，请重试");
 		} finally {
 			setSaving(false);
 		}
 	};
 
-	if (!config) return <div className="settings">加载中…</div>;
+	if (!config)
+		return (
+			<div className="settings">
+				{error ?? "加载中…"}
+				<button
+					onClick={() =>
+						void reload().catch((error) => setError(String(error)))
+					}
+				>
+					重新加载
+				</button>
+			</div>
+		);
 
 	return (
 		<div className="settings">
+			{error && (
+				<div className="error" role="alert">
+					{error}
+				</div>
+			)}
 			<h2>模型提供商</h2>
 			<label>
 				提供商
-				<select value={provider} onChange={(e) => (setProvider(e.target.value), setModelId(""))}>
+				<select
+					value={provider}
+					onChange={(e) => (
+						setProvider(e.target.value),
+						setModelId(""),
+						setApiKey("")
+					)}
+				>
 					{config.providers.map((p) => (
 						<option key={p.id} value={p.id}>
 							{p.id}
@@ -99,7 +127,10 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 			</label>
 			<label>
 				思考级别
-				<select value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value as ThinkingLevel)}>
+				<select
+					value={thinkingLevel}
+					onChange={(e) => setThinkingLevel(e.target.value as ThinkingLevel)}
+				>
 					{THINKING_LEVELS.map((t) => (
 						<option key={t.value} value={t.value}>
 							{t.label}
@@ -120,7 +151,10 @@ export function SettingsPanel(props: { onSaved: () => void }) {
 				{saving ? "保存中…" : "保存"}
 			</button>
 
-			<CustomProvidersSection providers={config.customProviders} onChanged={reload} />
+			<CustomProvidersSection
+				providers={config.customProviders}
+				onChanged={reload}
+			/>
 		</div>
 	);
 }

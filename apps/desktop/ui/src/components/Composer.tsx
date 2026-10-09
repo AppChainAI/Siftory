@@ -1,39 +1,86 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
-/** 输入框：Enter 发送，Shift+Enter 换行；busy 时变为可停止 */
-export function Composer(props: { busy: boolean; onSend: (text: string) => void; onStop: () => void }) {
+export function Composer(props: {
+	busy: boolean;
+	connected: boolean;
+	onSend: (text: string, requestId: string) => Promise<unknown>;
+	onStop: () => Promise<unknown>;
+}) {
 	const [text, setText] = useState("");
-
-	const send = () => {
+	const [sending, setSending] = useState(false);
+	const [error, setError] = useState<string>();
+	const pending = useRef<{ text: string; id: string } | undefined>(undefined);
+	const inFlight = useRef(false);
+	const send = async () => {
 		const value = text.trim();
-		if (!value) return;
-		props.onSend(value);
-		setText("");
+		if (!value || inFlight.current || !props.connected) return;
+		if (pending.current?.text !== value)
+			pending.current = { text: value, id: crypto.randomUUID() };
+		inFlight.current = true;
+		setSending(true);
+		setError(undefined);
+		try {
+			await props.onSend(value, pending.current.id);
+			setText((current) => (current.trim() === value ? "" : current));
+			pending.current = undefined;
+		} catch (error) {
+			setError(error instanceof Error ? error.message : "发送失败，请重试");
+		} finally {
+			inFlight.current = false;
+			setSending(false);
+		}
 	};
-
+	const stop = async () => {
+		try {
+			await props.onStop();
+		} catch (error) {
+			setError(error instanceof Error ? error.message : "停止失败，请重试");
+		}
+	};
 	return (
-		<div className="composer">
-			<textarea
-				value={text}
-				placeholder="给 Siftory 一个主题或任务…"
-				rows={3}
-				onChange={(e) => setText(e.target.value)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-						e.preventDefault();
-						send();
-					}
-				}}
-			/>
-			{props.busy ? (
-				<button className="stop" onClick={props.onStop}>
-					停止
-				</button>
-			) : (
-				<button onClick={send} disabled={!text.trim()}>
-					发送
-				</button>
+		<div>
+			{error && (
+				<div className="error" role="alert">
+					{error}
+				</div>
 			)}
+			{props.busy && (
+				<div className="hint">新消息将排队，在当前任务完成后执行。</div>
+			)}
+			<div className="composer">
+				<textarea
+					value={text}
+					aria-label="主题或任务"
+					placeholder="给 Siftory 一个主题或任务…"
+					rows={3}
+					onChange={(event) => setText(event.target.value)}
+					onKeyDown={(event) => {
+						if (
+							event.key === "Enter" &&
+							!event.shiftKey &&
+							!event.nativeEvent.isComposing
+						) {
+							event.preventDefault();
+							void send();
+						}
+					}}
+				/>
+				{props.busy && (
+					<button
+						className="stop"
+						disabled={!props.connected}
+						onClick={() => void stop()}
+					>
+						停止
+					</button>
+				)}
+				<button
+					disabled={!text.trim() || sending || !props.connected}
+					onClick={() => void send()}
+				>
+					{sending ? "发送中…" : props.busy ? "排队发送" : "发送"}
+				</button>
+			</div>
 		</div>
 	);
 }

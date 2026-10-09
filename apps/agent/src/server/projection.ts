@@ -1,4 +1,4 @@
-import type { ConversationView } from "@earendil-works/pi-durable";
+import type { ConversationView, EntryRecord } from "@earendil-works/pi-durable";
 import type { ChatMessage, ChatSnapshot, ModelRef } from "@siftory/protocol";
 
 type ContentBlock = { type: string; text?: string };
@@ -14,26 +14,61 @@ function extractText(message: Message | undefined): string {
 }
 
 /** ConversationView（pi-durable 原始结构）→ UI 协议快照。UI 不感知 pi-durable 的 API 形状。 */
-export function projectChatView(view: ConversationView): ChatSnapshot {
-	const messages: ChatMessage[] = [];
-	for (const entry of view.entries) {
-		const role = entry.kind === "pi.user" ? "user" : entry.kind === "pi.assistant" ? "assistant" : undefined;
-		if (!role) continue;
-		const text = extractText(entry.model?.[0] as Message | undefined);
-		if (text) messages.push({ id: entry.id, role, text });
+export function projectChatView(
+	view: ConversationView,
+	terminalError?: string,
+): ChatSnapshot {
+	// Bound each streaming frame to the newest 200 visible text messages.
+	const selected: EntryRecord[] = [];
+	let index = view.entries.length - 1;
+	for (; index >= 0; index--) {
+		const entry = view.entries[index];
+		if (
+			(entry.kind === "pi.user" || entry.kind === "pi.assistant") &&
+			extractText(entry.model?.[0] as Message | undefined)
+		)
+			selected.push(entry);
+		if (selected.length === 200) {
+			index--;
+			break;
+		}
 	}
+	const messages = projectMessages(selected.reverse());
 
 	const live = view.docs["pi.live"] as
-		| { run?: unknown; generation?: { message?: Message; retry?: { error: string } } }
+		| {
+				run?: unknown;
+				generation?: { message?: Message; retry?: { error: string } };
+		  }
 		| undefined;
 	const agent = view.docs["pi.agent"] as { model?: ModelRef } | undefined;
 
 	return {
 		type: "chat",
 		messages,
+		historyBefore: index >= 0 ? messages[0]?.id : undefined,
 		busy: live?.run !== undefined,
 		streamingText: extractText(live?.generation?.message) || undefined,
-		lastError: live?.generation?.retry?.error,
+		lastError: live?.generation?.retry?.error ?? terminalError,
+		queued:
+			(view.docs["pi.inbox"] as { items?: unknown[] } | undefined)?.items
+				?.length ?? 0,
 		model: agent?.model,
 	};
+}
+
+export function projectMessages(
+	entries: readonly EntryRecord[],
+): ChatMessage[] {
+	return entries.flatMap((entry) => {
+		const role =
+			entry.kind === "pi.user"
+				? "user"
+				: entry.kind === "pi.assistant"
+					? "assistant"
+					: undefined;
+		if (!role) return [];
+		const text = extractText(entry.model?.[0] as Message | undefined);
+		return text ? [{ id: String(entry.id), role, text }] : [];
+	});
 }

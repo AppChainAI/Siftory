@@ -1,13 +1,27 @@
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels, type MutableModels } from "@earendil-works/pi-ai/models";
+import {
+	createModels,
+	type MutableModels,
+	type Provider,
+} from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
-import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
+import {
+	fauxAssistantMessage,
+	fauxProvider,
+	type FauxResponseFactory,
+} from "@earendil-works/pi-ai/providers/faux";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
-import { createRegistry, Harness, type AgentChange, type Conversation } from "@earendil-works/pi-durable";
+import {
+	createRegistry,
+	Harness,
+	type AgentChange,
+	type SubmissionRecord,
+	type Conversation,
+} from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AgentConfigView, CustomProvider } from "@siftory/protocol";
 import { authFile, FileCredentialStore } from "./config";
@@ -18,6 +32,7 @@ import {
 	unregisterCustomProvider,
 } from "./custom-providers";
 import { installAll } from "./extensions";
+import { acquireOwnership } from "./storage/ownership";
 import { openBunSqlite } from "./storage/sqlite";
 
 export interface AgentHost {
@@ -36,20 +51,41 @@ export interface AgentHost {
 	/** 会话级 LLM 配置：改的是 root 的 pi.agent 文档（SQLite 持久） */
 	getAgent(): Promise<AgentConfigView>;
 	configureAgent(change: AgentChange): Promise<void>;
+	latestSubmission(): Promise<SubmissionRecord | undefined>;
 	close(): Promise<void>;
 }
 
 const context = BACKGROUND_CONTEXT;
 
-export async function createAgentHost(dataDir: string, options: { dev?: boolean } = {}): Promise<AgentHost> {
+export async function createAgentHost(
+	dataDir: string,
+	options: { dev?: boolean } = {},
+): Promise<AgentHost> {
+	const release = acquireOwnership(dataDir);
+	try {
+		const host = await openHost(dataDir, options);
+		const close = host.close;
+		let closing: Promise<void> | undefined;
+		host.close = () => (closing ??= close().finally(release));
+		return host;
+	} catch (error) {
+		release();
+		throw error;
+	}
+}
+
+async function openHost(
+	dataDir: string,
+	options: { dev?: boolean },
+): Promise<AgentHost> {
 	const credentials = new FileCredentialStore(authFile(dataDir));
 
 	const models = createModels({ credentials });
 	// 提供商目录：env 变量也可作为密钥来源（pi-ai 的 resolve 合并 stored credential 与环境变量）。
 	// catalogs 保留 Provider 引用：模型目录与 auth 解耦，下拉列表不需要先存密钥。
 	const catalogs = new Map<string, () => readonly { id: string }[]>();
-	const register = (id: string, provider: { getModels(): readonly { id: string }[] }) => {
-		models.setProvider(provider as never);
+	const register = (id: string, provider: Provider) => {
+		models.setProvider(provider);
 		catalogs.set(id, () => provider.getModels());
 	};
 	register("openai", openaiProvider());
@@ -57,7 +93,13 @@ export async function createAgentHost(dataDir: string, options: { dev?: boolean 
 	register("google", googleProvider());
 	register("deepseek", deepseekProvider());
 	register("openrouter", openrouterProvider());
-	const providerIds = ["openai", "anthropic", "google", "deepseek", "openrouter"];
+	const providerIds = [
+		"openai",
+		"anthropic",
+		"google",
+		"deepseek",
+		"openrouter",
+	];
 	if (options.dev) {
 		// 开发用假模型：无密钥也能跑通全链路（faux/faux-1）
 		const faux = fauxProvider({ tokensPerSecond: 40 });
@@ -69,7 +111,9 @@ export async function createAgentHost(dataDir: string, options: { dev?: boolean 
 			const text = typeof last?.content === "string" ? last.content : "";
 			// 加长尾巴让 dev 下能看到流式效果（faux 40 tokens/s）
 			return fauxAssistantMessage(
-				`[faux] 收到：${text || "（空）"}\n\n这是一段用于演示流式输出的占位回答。`.repeat(3),
+				`[faux] 收到：${text || "（空）"}\n\n这是一段用于演示流式输出的占位回答。`.repeat(
+					3,
+				),
 			);
 		};
 		faux.setResponses([respond]);
@@ -80,23 +124,36 @@ export async function createAgentHost(dataDir: string, options: { dev?: boolean 
 	installAll(registry);
 
 	// 自定义 OpenAI 兼容供应商（providers.json）
-	const customProviders = await loadCustomProviders(dataDir);
+	let customProviders = await loadCustomProviders(dataDir);
+	let mutation: Promise<unknown> = Promise.resolve();
+	const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+		const next = mutation.then(fn);
+		mutation = next.catch(() => {});
+		return next;
+	};
 	for (const custom of customProviders) {
 		const provider = registerCustomProvider(models, custom);
 		catalogs.set(custom.id, () => provider.getModels());
 		providerIds.push(custom.id);
 	}
 
-	const storage = await SqliteStorage.open(openBunSqlite(join(dataDir, "siftory.sqlite")));
+	const storage = await SqliteStorage.open(
+		openBunSqlite(join(dataDir, "siftory.sqlite")),
+	);
 	const harness = await Harness.open(storage, { models, registry }, context);
 	const root = await harness.root(context);
-	harness.resume(); // 续跑上次进程未完成的工作
+	// Configure defaults before resuming pending work.
 
 	// 模型选择存在 root 的 pi.agent 里，重启自动保留；只有从未配置过时 dev 才兜底 faux
 	const resolved = await root.agent(context);
 	if (!resolved.model && options.dev) {
-		await root.configure({ model: { provider: "faux", modelId: "faux-1" } }, context);
+		await root.configure(
+			{ model: { provider: "faux", modelId: "faux-1" } },
+			context,
+		);
 	}
+
+	harness.resume();
 
 	return {
 		harness,
@@ -104,27 +161,53 @@ export async function createAgentHost(dataDir: string, options: { dev?: boolean 
 		models,
 		credentials,
 		providerIds,
-		catalogModels: (id) => catalogs.get(id)?.().map((m) => m.id) ?? [],
-		listCustomProviders: () => customProviders,
-		upsertCustomProvider: async (custom, apiKey) => {
-			const index = customProviders.findIndex((p) => p.id === custom.id);
-			if (index >= 0) customProviders[index] = custom;
-			else customProviders.push(custom);
-			await saveCustomProviders(dataDir, customProviders);
-			if (apiKey) await credentials.modify(custom.id, async () => ({ type: "api_key", key: apiKey }));
-			if (!providerIds.includes(custom.id)) providerIds.push(custom.id);
-			catalogs.set(custom.id, () => registerCustomProvider(models, custom).getModels()); // setProvider 同名即替换
-		},
-		deleteCustomProvider: async (id) => {
-			const index = customProviders.findIndex((p) => p.id === id);
-			if (index >= 0) customProviders.splice(index, 1);
-			await saveCustomProviders(dataDir, customProviders);
-			await credentials.delete(id);
-			const i = providerIds.indexOf(id);
-			if (i >= 0) providerIds.splice(i, 1);
-			catalogs.delete(id);
-			unregisterCustomProvider(models, id);
-		},
+		catalogModels: (id) =>
+			catalogs
+				.get(id)?.()
+				.map((m) => m.id) ?? [],
+		listCustomProviders: () => structuredClone(customProviders),
+		upsertCustomProvider: (custom, apiKey) =>
+			serialize(async () => {
+				const next = customProviders
+					.filter((p) => p.id !== custom.id)
+					.concat(structuredClone(custom));
+				await saveCustomProviders(dataDir, next);
+				try {
+					if (apiKey)
+						await credentials.modify(custom.id, async () => ({
+							type: "api_key",
+							key: apiKey,
+						}));
+				} catch (error) {
+					await saveCustomProviders(dataDir, customProviders);
+					throw error;
+				}
+				customProviders = next;
+				const provider = registerCustomProvider(models, custom);
+				catalogs.set(custom.id, () => provider.getModels());
+				if (!providerIds.includes(custom.id)) providerIds.push(custom.id);
+			}),
+		deleteCustomProvider: (id) =>
+			serialize(async () => {
+				if (!customProviders.some((p) => p.id === id))
+					throw new Error("Unknown custom provider");
+				if ((await root.agent(context)).model?.provider === id)
+					throw new Error("Select another model before deleting its provider");
+				const next = customProviders.filter((p) => p.id !== id);
+				// Persist the definition first; rollback it if the credential operation fails.
+				await saveCustomProviders(dataDir, next);
+				try {
+					await credentials.delete(id);
+				} catch (error) {
+					await saveCustomProviders(dataDir, customProviders);
+					throw error;
+				}
+				customProviders = next;
+				const i = providerIds.indexOf(id);
+				if (i >= 0) providerIds.splice(i, 1);
+				catalogs.delete(id);
+				unregisterCustomProvider(models, id);
+			}),
 		getAgent: async () => {
 			const agent = await root.agent(context);
 			return {
@@ -134,6 +217,15 @@ export async function createAgentHost(dataDir: string, options: { dev?: boolean 
 			};
 		},
 		configureAgent: (change) => root.configure(change, context),
+		latestSubmission: async () =>
+			(
+				await storage.scanSubmissions(
+					{ conversationId: root.id, order: "descending" },
+					1,
+					undefined,
+					context,
+				)
+			).items[0],
 		close: () => harness.close(context),
 	};
 }

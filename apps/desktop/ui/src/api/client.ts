@@ -1,3 +1,4 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
 	DEV_AGENT_PORT,
 	type ChatSnapshot,
@@ -5,83 +6,99 @@ import {
 	type ConfigUpdate,
 	type ConfigView,
 	type CustomProviderUpsert,
+	type HistoryPage,
 } from "@siftory/protocol";
 
-/** dev 下经 Vite 代理到 sidecar；Tauri 下由 Rust 注入端口/token 到 window.__SIFTORY__ */
-declare global {
-	interface Window {
-		__SIFTORY__?: { port: number; token: string };
-	}
+type Connection = { port: number; token?: string | null };
+async function connection(): Promise<Connection | undefined> {
+	return isTauri() ? invoke<Connection>("agent_connection") : undefined;
 }
-
-const injected = window.__SIFTORY__;
-const base = injected ? `http://127.0.0.1:${injected.port}` : "";
-const authHeaders = (): Record<string, string> =>
-	injected ? { authorization: `Bearer ${injected.token}` } : {};
-
-export async function getConfig(): Promise<ConfigView> {
-	const res = await fetch(`${base}/api/config`, { headers: authHeaders() });
-	return res.json();
+async function request<T>(
+	path: string,
+	method = "GET",
+	body?: unknown,
+): Promise<T> {
+	const agent = await connection();
+	const response = await fetch(
+		`${agent ? `http://127.0.0.1:${agent.port}` : ""}${path}`,
+		{
+			method,
+			headers: {
+				...(body === undefined ? {} : { "content-type": "application/json" }),
+				...(agent?.token ? { authorization: `Bearer ${agent.token}` } : {}),
+			},
+			body: body === undefined ? undefined : JSON.stringify(body),
+			signal: AbortSignal.timeout(30_000),
+		},
+	);
+	const result = await response.json().catch(() => undefined);
+	if (!response.ok)
+		throw new Error(result?.error ?? `请求失败（${response.status}）`);
+	return result as T;
 }
+export const getHistory = (before: string) =>
+	request<HistoryPage>(`/api/history?before=${encodeURIComponent(before)}`);
+export const getConfig = () => request<ConfigView>("/api/config");
+export const putConfig = (update: ConfigUpdate) =>
+	request<void>("/api/config", "PUT", update);
+export const sendChat = (content: string, requestId: string) =>
+	request<ChatSubmitResult>("/api/chat", "POST", { content, requestId });
+export const abortChat = () => request<void>("/api/abort", "POST");
+export const upsertCustomProvider = (input: CustomProviderUpsert) =>
+	request<void>("/api/custom-providers", "PUT", input);
+export const deleteCustomProvider = (id: string) =>
+	request<void>(`/api/custom-providers/${encodeURIComponent(id)}`, "DELETE");
 
-export async function putConfig(update: ConfigUpdate): Promise<void> {
-	await fetch(`${base}/api/config`, {
-		method: "PUT",
-		headers: { "content-type": "application/json", ...authHeaders() },
-		body: JSON.stringify(update),
-	});
-}
-
-export async function sendChat(content: string): Promise<ChatSubmitResult> {
-	const res = await fetch(`${base}/api/chat`, {
-		method: "POST",
-		headers: { "content-type": "application/json", ...authHeaders() },
-		body: JSON.stringify({ content, requestId: crypto.randomUUID() }),
-	});
-	return res.json();
-}
-
-export async function abortChat(): Promise<void> {
-	await fetch(`${base}/api/abort`, { method: "POST", headers: authHeaders() });
-}
-
-export async function upsertCustomProvider(input: CustomProviderUpsert): Promise<void> {
-	await fetch(`${base}/api/custom-providers`, {
-		method: "PUT",
-		headers: { "content-type": "application/json", ...authHeaders() },
-		body: JSON.stringify(input),
-	});
-}
-
-export async function deleteCustomProvider(id: string): Promise<void> {
-	await fetch(`${base}/api/custom-providers/${encodeURIComponent(id)}`, {
-		method: "DELETE",
-		headers: authHeaders(),
-	});
-}
-
-/** 订阅会话快照；返回关闭函数。断线自动重连。 */
-export function subscribeChat(onSnapshot: (snapshot: ChatSnapshot) => void): () => void {
-	let ws: WebSocket | undefined;
+export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+export function subscribeChat(
+	onSnapshot: (snapshot: ChatSnapshot) => void,
+	onStatus: (status: ConnectionStatus, error?: string) => void,
+): () => void {
+	let socket: WebSocket | undefined;
 	let closed = false;
 	let retry: ReturnType<typeof setTimeout> | undefined;
-
-	const connect = () => {
-		// dev 下直连 sidecar，不经 Vite 代理：代理中转会让客户端断开时刷 EPIPE 噪音
-		const url = injected
-			? `ws://127.0.0.1:${injected.port}/ws?token=${encodeURIComponent(injected.token)}`
-			: `ws://127.0.0.1:${DEV_AGENT_PORT}/ws`;
-		ws = new WebSocket(url);
-		ws.onmessage = (e) => onSnapshot(JSON.parse(String(e.data)));
-		ws.onclose = () => {
-			if (!closed) retry = setTimeout(connect, 1000);
-		};
+	let delay = 500;
+	const reconnect = (error?: string) => {
+		if (closed) return;
+		onStatus("disconnected", error);
+		retry = setTimeout(() => void connect(), delay);
+		delay = Math.min(delay * 2, 10_000);
 	};
-	connect();
-
+	const connect = async () => {
+		if (closed) return;
+		onStatus("connecting");
+		try {
+			const agent = await connection();
+			if (closed) return;
+			socket = new WebSocket(
+				`ws://127.0.0.1:${agent?.port ?? DEV_AGENT_PORT}/ws${agent?.token ? `?token=${encodeURIComponent(agent.token)}` : ""}`,
+			);
+			socket.onmessage = (event) => {
+				try {
+					const snapshot = JSON.parse(String(event.data));
+					if (
+						snapshot.type !== "chat" ||
+						!Array.isArray(snapshot.messages) ||
+						typeof snapshot.busy !== "boolean"
+					)
+						throw new Error("Invalid snapshot");
+					delay = 500;
+					onStatus("connected");
+					onSnapshot(snapshot);
+				} catch {
+					socket?.close(1002, "Invalid snapshot");
+				}
+			};
+			socket.onclose = () => reconnect();
+			socket.onerror = () => socket?.close();
+		} catch (error) {
+			reconnect(error instanceof Error ? error.message : String(error));
+		}
+	};
+	void connect();
 	return () => {
 		closed = true;
 		clearTimeout(retry);
-		ws?.close();
+		socket?.close();
 	};
 }

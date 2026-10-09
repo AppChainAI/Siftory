@@ -1,6 +1,10 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import type { Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai/models";
+import { readJson, writeJson } from "./storage/files";
+import { join } from "node:path";
+import type {
+	Credential,
+	CredentialInfo,
+	CredentialStore,
+} from "@earendil-works/pi-ai";
 
 /**
  * 提供商密钥存储：`<data-dir>/auth.json`，形状与 pi 的 auth.json 相同
@@ -13,18 +17,30 @@ export class FileCredentialStore implements CredentialStore {
 	constructor(private readonly file: string) {}
 
 	private async readAll(): Promise<Record<string, Credential>> {
-		try {
-			return JSON.parse(await readFile(this.file, "utf8"));
-		} catch {
-			return {}; // 文件不存在或损坏都按空处理
+		const all = await readJson(this.file, {});
+		if (
+			!all ||
+			typeof all !== "object" ||
+			Array.isArray(all) ||
+			Object.values(all).some(
+				(c) =>
+					!c ||
+					typeof c !== "object" ||
+					!("type" in c) ||
+					("type" in c &&
+						c.type === "api_key" &&
+						(!("key" in c) || typeof c.key !== "string")),
+			)
+		) {
+			throw new Error(
+				"Invalid credential file; restore it before saving credentials",
+			);
 		}
+		return all as Record<string, Credential>;
 	}
 
-	private async writeAll(data: Record<string, Credential>): Promise<void> {
-		await mkdir(dirname(this.file), { recursive: true });
-		const tmp = `${this.file}.tmp`;
-		await writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-		await rename(tmp, this.file);
+	private writeAll(data: Record<string, Credential>): Promise<void> {
+		return writeJson(this.file, data, 0o600);
 	}
 
 	private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -38,11 +54,19 @@ export class FileCredentialStore implements CredentialStore {
 	}
 
 	async list(): Promise<readonly CredentialInfo[]> {
-		const all = await this.readAll();
-		return Object.entries(all).map(([providerId, c]) => ({ providerId, type: c.type }));
+		return this.enqueue(async () => {
+			const all = await this.readAll();
+			return Object.entries(all).map(([providerId, c]) => ({
+				providerId,
+				type: c.type,
+			}));
+		});
 	}
 
-	modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>): Promise<Credential | undefined> {
+	modify(
+		providerId: string,
+		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+	): Promise<Credential | undefined> {
 		return this.enqueue(async () => {
 			const all = await this.readAll();
 			const next = await fn(all[providerId]);
@@ -50,7 +74,7 @@ export class FileCredentialStore implements CredentialStore {
 				all[providerId] = next;
 				await this.writeAll(all);
 			}
-			return next;
+			return next ?? all[providerId];
 		});
 	}
 
@@ -64,4 +88,3 @@ export class FileCredentialStore implements CredentialStore {
 }
 
 export const authFile = (dataDir: string) => join(dataDir, "auth.json");
-
