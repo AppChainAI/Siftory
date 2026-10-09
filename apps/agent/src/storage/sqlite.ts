@@ -13,7 +13,8 @@ import type {
  * 满足契约"事务期间无关操作必须排队"。
  */
 export function openBunSqlite(file: string): SqliteDatabase {
-	mkdirSync(dirname(file), { recursive: true });
+	// ":memory:" 无父目录；且 Windows 上 Bun 对 "." 递归 mkdir 抛 EEXIST（oven-sh/bun#44576）
+	if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
 	const db = new Database(file);
 	db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
 

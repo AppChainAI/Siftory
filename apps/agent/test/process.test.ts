@@ -2,11 +2,12 @@ import { expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import type { ChatSnapshot } from "@siftory/protocol";
 
 async function start(directory: string, dev = false, watchParent = false) {
 	const binary = process.env.SIFTORY_TEST_BINARY;
-	const entry = new URL("../src/main.ts", import.meta.url).pathname;
+	const entry = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 	const child = Bun.spawn(
 		[
 			...(binary ? [binary] : [process.execPath, entry]),
