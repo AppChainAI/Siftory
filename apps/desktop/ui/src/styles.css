@@ -31,6 +31,16 @@ header h1 {
 	font-size: 18px;
 	margin: 0;
 }
+.brand {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	flex-shrink: 0;
+}
+.brand-logo {
+	display: block;
+	border-radius: 7px;
+}
 header .model {
 	color: #8a8f98;
 	font-size: 13px;

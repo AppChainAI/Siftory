@@ -18,6 +18,10 @@ Development data lives in `apps/agent/.data`. Release desktop data uses Tauri's 
 
 ## Validation and packaging
 
+The approved pelican artwork supplies the UI, browser, macOS and Windows icons.
+Run `bun run icons` to regenerate them; see [branding](docs/branding.md) for the
+platform exports and source artwork.
+
 ```sh
 bun run check               # strict Agent types and frontend production build
 bun run test                # storage conformance, host/API and crash-recovery tests

@@ -90,7 +90,10 @@ export function App() {
 	return (
 		<div className="app">
 			<header>
-				<h1>Siftory</h1>
+				<h1 className="brand">
+					<img className="brand-logo" src="/logo.png" alt="" width={32} height={32} />
+					Siftory
+				</h1>
 				<span className="model">
 					{snapshot?.model
 						? `${snapshot.model.provider}/${snapshot.model.modelId}`

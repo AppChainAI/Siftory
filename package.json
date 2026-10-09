@@ -8,6 +8,7 @@
     "packages/protocol"
   ],
   "scripts": {
+    "icons": "bun scripts/generate-icons.ts",
     "dev": "bun scripts/dev.ts",
     "dev:desktop": "bun scripts/dev-desktop.ts",
     "dev:agent": "bun run --cwd apps/agent dev",
@@ -20,6 +21,7 @@
     "test:native": "bun scripts/test-sidecar.ts --native"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.1"
+    "@tauri-apps/cli": "^2.12.1",
+    "sharp": "^0.35.5"
   }
 }
